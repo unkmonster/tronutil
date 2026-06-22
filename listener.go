@@ -45,6 +45,18 @@ func WithLogger(logger log.Logger) Option {
 	}
 }
 
+func WithPersister(p Persister) Option {
+	return func(l *Listener) {
+		l.persister = p
+	}
+}
+
+func WithClient(client *client.GrpcClient) Option {
+	return func(l *Listener) {
+		l.client = client
+	}
+}
+
 type Listener struct {
 	logger log.Logger
 	log    *log.Helper
@@ -58,6 +70,8 @@ type Listener struct {
 
 	done   chan struct{}
 	cancel context.CancelFunc
+
+	persister Persister
 }
 
 func New(opts ...Option) *Listener {
@@ -70,7 +84,9 @@ func New(opts ...Option) *Listener {
 	}
 
 	l.log = buildHelper(l.logger)
-	l.client = newClient(l)
+	if l.client == nil {
+		l.client = newClient(l)
+	}
 
 	return l
 }
@@ -93,12 +109,12 @@ func (l *Listener) Start(ctx context.Context) error {
 	l.cancel = cancel
 
 	// prepare worker params
-	height, err := l.getCurrentHeight(ctx)
+	height, err := l.getInitialHeight(ctx)
 	if err != nil {
-		return fmt.Errorf("fetch current latest block height: %w", err)
+		return fmt.Errorf("retrieve initial height: %w", err)
 	}
 
-	l.log.WithContext(ctx).Infof("[block_listener] start at %d", height)
+	l.log.WithContext(ctx).Infof("[block_listener] starting at %d", height)
 	go l.worker(ctx, &workerParams{
 		height: height,
 	})
@@ -121,7 +137,25 @@ func (l *Listener) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (l *Listener) getCurrentHeight(ctx context.Context) (int64, error) {
+func (l *Listener) getInitialHeight(ctx context.Context) (height int64, err error) {
+	if l.persister != nil {
+		height, err = l.persister.LoadNextHeight(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("load persisted height: %w", err)
+		}
+	}
+
+	if height == 0 {
+		height, err = l.getNowHeight(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("fetch now block height: %w", err)
+		}
+	}
+
+	return
+}
+
+func (l *Listener) getNowHeight(ctx context.Context) (int64, error) {
 	b, err := l.client.GetNowBlockCtx(ctx)
 	if err != nil {
 		return 0, err
@@ -195,7 +229,6 @@ func (l *Listener) worker(ctx context.Context, params *workerParams) {
 			nowHeight = block.GetBlockHeader().GetRawData().GetNumber()
 			if nowHeight == nextHeight {
 				nextHeight = l.processBlocks(ctx, block)
-				continue
 			} else {
 				// 当前区块高度不等于期待的区块高度，
 				// 批量获取并处理 [期待高度, 最新区块高度) 内的所有区块
@@ -210,6 +243,17 @@ func (l *Listener) worker(ctx context.Context, params *workerParams) {
 					continue
 				}
 				nextHeight = l.processBlocks(ctx, append(blockList.GetBlock(), block)...)
+			}
+
+			if l.persister != nil {
+				err := l.persister.SaveNextHeight(ctx, nextHeight)
+				if err != nil {
+					l.log.WithContext(ctx).Errorw(
+						"msg", "failed to save next height",
+						"reason", err,
+						"next_height", nextHeight,
+					)
+				}
 			}
 		}
 	}

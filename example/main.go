@@ -16,6 +16,7 @@ func main() {
 		tronblocklistener.WithDialOptions(
 			client.GRPCInsecure(),
 		),
+		tronblocklistener.WithPersister(tronblocklistener.NewFilePersister("height.txt")),
 	)
 
 	ctx := context.Background()
