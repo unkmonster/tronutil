@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/fbsobreira/gotron-sdk/pkg/client"
-	tronblocklistener "github.com/unkmonster/tron-block-listener"
+	tronblocklistener "github.com/unkmonster/tronutil/listener"
 )
 
 func main() {

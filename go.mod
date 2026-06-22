@@ -1,4 +1,4 @@
-module github.com/unkmonster/tron-block-listener
+module github.com/unkmonster/tronutil
 
 go 1.25.5
 
