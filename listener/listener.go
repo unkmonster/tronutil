@@ -61,10 +61,11 @@ type Listener struct {
 	logger log.Logger
 	log    *log.Helper
 
-	address     string
-	timeout     time.Duration
-	dialOptions []grpc.DialOption
-	client      *client.GrpcClient
+	address        string
+	timeout        time.Duration
+	dialOptions    []grpc.DialOption
+	client         *client.GrpcClient
+	internalClient bool
 
 	blockHandlers []HandleBlockFunc
 
@@ -85,6 +86,7 @@ func New(opts ...Option) *Listener {
 
 	l.log = buildHelper(l.logger)
 	if l.client == nil {
+		l.internalClient = true
 		l.client = newClient(l)
 	}
 
@@ -99,9 +101,11 @@ func newClient(l *Listener) *client.GrpcClient {
 // Start starts the listener
 func (l *Listener) Start(ctx context.Context) error {
 	// start tron client
-	err := l.client.Start(l.dialOptions...)
-	if err != nil {
-		return fmt.Errorf("start tron client: %w", err)
+	if l.internalClient {
+		err := l.client.Start(l.dialOptions...)
+		if err != nil {
+			return fmt.Errorf("start tron client: %w", err)
+		}
 	}
 
 	// set context
@@ -133,7 +137,9 @@ func (l *Listener) Stop(ctx context.Context) error {
 	case <-l.done:
 	}
 
-	l.client.Stop()
+	if l.internalClient {
+		l.client.Stop()
+	}
 	return nil
 }
 
