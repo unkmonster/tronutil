@@ -2,13 +2,22 @@ package tronblocklistener
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/fbsobreira/gotron-sdk/pkg/client"
+	"github.com/fbsobreira/gotron-sdk/pkg/proto/api"
 	"github.com/go-kratos/kratos/v2/log"
 	"google.golang.org/grpc"
 )
+
+var (
+	blockProducedSpeed = 3 * time.Second
+)
+
+type HandleBlockFunc func(ctx context.Context, b *api.BlockExtention)
 
 type Option func(l *Listener)
 
@@ -45,6 +54,8 @@ type Listener struct {
 	dialOptions []grpc.DialOption
 	client      *client.GrpcClient
 
+	blockHandlers []HandleBlockFunc
+
 	done   chan struct{}
 	cancel context.CancelFunc
 }
@@ -71,16 +82,26 @@ func newClient(l *Listener) *client.GrpcClient {
 
 // Start starts the listener
 func (l *Listener) Start(ctx context.Context) error {
-	l.log.WithContext(ctx).Infof("[block_listener] starting")
-
+	// start tron client
 	err := l.client.Start(l.dialOptions...)
 	if err != nil {
 		return fmt.Errorf("start tron client: %w", err)
 	}
 
+	// set context
 	ctx, cancel := context.WithCancel(ctx)
 	l.cancel = cancel
-	go l.worker(ctx)
+
+	// prepare worker params
+	height, err := l.getCurrentHeight(ctx)
+	if err != nil {
+		return fmt.Errorf("fetch current latest block height: %w", err)
+	}
+
+	l.log.WithContext(ctx).Infof("[block_listener] start at %d", height)
+	go l.worker(ctx, &workerParams{
+		height: height,
+	})
 	return nil
 }
 
@@ -100,15 +121,106 @@ func (l *Listener) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (l *Listener) worker(ctx context.Context) {
+func (l *Listener) getCurrentHeight(ctx context.Context) (int64, error) {
+	b, err := l.client.GetNowBlockCtx(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return b.GetBlockHeader().GetRawData().GetNumber(), nil
+}
+
+func (l *Listener) handleBlock(ctx context.Context, b *api.BlockExtention) {
+	for _, h := range l.blockHandlers {
+		h(ctx, b)
+	}
+	l.log.WithContext(ctx).Infow(
+		"event", "block handling completed",
+		"block.height", b.BlockHeader.RawData.Number,
+		"block.id", hex.EncodeToString(b.GetBlockid()),
+	)
+}
+
+// processBlocks processes given blocks, returns expected next block height
+func (l *Listener) processBlocks(ctx context.Context, blocks ...*api.BlockExtention) (next int64) {
+	if len(blocks) == 0 {
+		panic("empty blocks")
+	}
+
+	// make sure the blocks is in increasing order
+	slices.SortFunc(blocks, func(a *api.BlockExtention, b *api.BlockExtention) int {
+		return int(a.BlockHeader.RawData.Number - b.BlockHeader.RawData.Number)
+	})
+	// calculate the next height
+	next = blocks[len(blocks)-1].BlockHeader.RawData.Number + 1
+
+	for _, block := range blocks {
+		l.handleBlock(ctx, block)
+	}
+	return
+}
+
+type workerParams struct {
+	height int64
+}
+
+func (l *Listener) worker(ctx context.Context, params *workerParams) {
 	defer close(l.done)
+
+	var (
+		tick = time.Tick(blockProducedSpeed)
+		// nextHeight holds nextHeight of next block to process
+		nextHeight = params.height
+	)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-tick:
+			var (
+				// now height
+				nowHeight int64
+			)
+
+			// 获取最新区块
+			block, err := l.client.GetNowBlockCtx(ctx)
+			if err != nil {
+				l.log.WithContext(ctx).Warnw(
+					"msg", "failed to fetch now block",
+					"reason", err,
+				)
+				continue
+			}
+
+			nowHeight = block.GetBlockHeader().GetRawData().GetNumber()
+			if nowHeight == nextHeight {
+				nextHeight = l.processBlocks(ctx, block)
+				continue
+			} else {
+				// 当前区块高度不等于期待的区块高度，
+				// 批量获取并处理 [期待高度, 最新区块高度) 内的所有区块
+				blockList, err := l.client.GetBlockByLimitNextCtx(ctx, nextHeight, nowHeight)
+				if err != nil {
+					l.log.WithContext(ctx).Warnw(
+						"msg", "failed to fetch block list",
+						"reason", err,
+						"next", nextHeight,
+						"now", nowHeight,
+					)
+					continue
+				}
+				nextHeight = l.processBlocks(ctx, append(blockList.GetBlock(), block)...)
+			}
 		}
 	}
+}
+
+func (l *Listener) AddBlockHandler(h HandleBlockFunc) {
+	l.blockHandlers = append(l.blockHandlers, h)
+}
+
+func (l *Listener) ResetBlockHandlers(handlers []HandleBlockFunc) {
+	l.blockHandlers = handlers
 }
 
 func buildHelper(logger log.Logger) *log.Helper {
