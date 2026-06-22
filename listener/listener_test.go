@@ -2,13 +2,11 @@ package listener
 
 import (
 	"context"
-	"crypto/tls"
 	"testing"
 	"time"
 
+	"github.com/fbsobreira/gotron-sdk/pkg/client"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 )
 
 func TestStartAndStop(t *testing.T) {
@@ -16,7 +14,7 @@ func TestStartAndStop(t *testing.T) {
 		WithAddr("grpc.trongrid.io:50051"),
 		WithTimeout(5*time.Second),
 		WithDialOptions(
-			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
+			client.GRPCInsecure(),
 		),
 	)
 	ctx := context.Background()
