@@ -24,7 +24,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	time.Sleep(30 * time.Second)
+	time.Sleep(10000 * time.Second)
 
 	log.Fatal(listener.Stop(ctx))
 }
