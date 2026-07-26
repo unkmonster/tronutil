@@ -10,38 +10,16 @@ import (
 	"github.com/fbsobreira/gotron-sdk/pkg/client"
 	"github.com/fbsobreira/gotron-sdk/pkg/proto/api"
 	"github.com/go-kratos/kratos/v2/log"
-	"google.golang.org/grpc"
 )
 
 const (
 	maxBatchGetBlockSize = 100
-)
-
-var (
-	blockProducedSpeed = 3 * time.Second
+	blockProducedSpeed   = 3 * time.Second
 )
 
 type HandleBlockFunc func(ctx context.Context, b *api.BlockExtention)
 
 type Option func(l *Listener)
-
-func WithAddr(addr string) Option {
-	return func(l *Listener) {
-		l.address = addr
-	}
-}
-
-func WithTimeout(t time.Duration) Option {
-	return func(l *Listener) {
-		l.timeout = t
-	}
-}
-
-func WithDialOptions(options ...grpc.DialOption) Option {
-	return func(l *Listener) {
-		l.dialOptions = options
-	}
-}
 
 func WithLogger(logger log.Logger) Option {
 	return func(l *Listener) {
@@ -65,12 +43,7 @@ type Listener struct {
 	logger log.Logger
 	log    *log.Helper
 
-	address        string
-	timeout        time.Duration
-	client         *client.GrpcClient
-	internalClient bool
-
-	dialOptions []grpc.DialOption
+	client *client.GrpcClient
 
 	blockHandlers []HandleBlockFunc
 
@@ -79,6 +52,7 @@ type Listener struct {
 
 	persister Persister
 
+	// 期待的下一个需要处理的区块的高度
 	nextHeight int64
 }
 
@@ -93,28 +67,14 @@ func New(opts ...Option) *Listener {
 
 	l.log = buildHelper(l.logger)
 	if l.client == nil {
-		l.internalClient = true
-		l.client = newClient(l)
+		panic("client required")
 	}
 
 	return l
 }
 
-func newClient(l *Listener) *client.GrpcClient {
-	client := client.NewGrpcClientWithTimeout(l.address, l.timeout)
-	return client
-}
-
-// Start starts the listener
+// Start 启动监听器并返回
 func (l *Listener) Start(ctx context.Context) error {
-	// start tron client
-	if l.internalClient {
-		err := l.client.Start(l.dialOptions...)
-		if err != nil {
-			return fmt.Errorf("start tron client: %w", err)
-		}
-	}
-
 	// set context
 	ctx, cancel := context.WithCancel(ctx)
 	l.cancel = cancel
@@ -135,17 +95,16 @@ func (l *Listener) Start(ctx context.Context) error {
 func (l *Listener) Stop(ctx context.Context) error {
 	l.log.WithContext(ctx).Infof("[block_listener] stopping")
 
-	// stop worker
+	// cancel worker context
 	l.cancel()
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-l.done:
+		// waiting for worker exited
 	}
 
-	if l.internalClient {
-		l.client.Stop()
-	}
 	return nil
 }
 
@@ -170,6 +129,7 @@ func (l *Listener) getInitialHeight(ctx context.Context) (height int64, local bo
 	return
 }
 
+// getNowHeight fetches and returns current latest block height
 func (l *Listener) getNowHeight(ctx context.Context) (int64, error) {
 	b, err := l.client.GetNowBlockCtx(ctx)
 	if err != nil {
@@ -204,7 +164,7 @@ func (l *Listener) trySaveNextHeight(ctx context.Context) {
 }
 
 // processBlocks processes given blocks, returns expected next block height
-// //input blocks must be non-empty
+// input blocks must be non-empty
 func (l *Listener) processBlocks(ctx context.Context, blocks ...*api.BlockExtention) {
 	// make sure the blocks is in increasing order
 	sortBlocks(blocks)
@@ -213,13 +173,15 @@ func (l *Listener) processBlocks(ctx context.Context, blocks ...*api.BlockExtent
 		curHeight := blockHeight(block)
 		if curHeight != l.nextHeight {
 			l.log.WithContext(ctx).Warnw(
-				"msg", "current height is mismatch with next height",
+				"msg", "current height is mismatch with expected next height",
 				"current", curHeight,
 				"next", l.nextHeight,
 			)
 			break
 		}
 
+		// FIXME: 如果区块处理完成后，机器断电，saveHeight 失败，
+		// 将导致这个区块在重启后被重复处理
 		l.handleBlock(ctx, block)
 		l.nextHeight++
 		l.trySaveNextHeight(ctx)
@@ -243,7 +205,6 @@ func (l *Listener) worker(ctx context.Context, params *workerParams) {
 			return
 		case <-tick:
 			var (
-				// now height
 				nowHeight int64
 				nowBlock  *api.BlockExtention
 				err       error
@@ -261,7 +222,7 @@ func (l *Listener) worker(ctx context.Context, params *workerParams) {
 			nowHeight = blockHeight(nowBlock)
 			if nowHeight <= 0 {
 				l.log.WithContext(ctx).Warnw(
-					"msg", "fetched now block with invalid height",
+					"msg", "now block with invalid height",
 					"raw", fmt.Sprintf("%+v", nowBlock),
 				)
 				continue
@@ -295,9 +256,12 @@ func (l *Listener) worker(ctx context.Context, params *workerParams) {
 					break
 				}
 
-				blocks := (blockList.GetBlock())
+				blocks := blockList.GetBlock()
 				sortBlocks(blocks)
+
 				if blockHeight(blocks[len(blocks)-1])+1 == blockHeight(nowBlock) {
+					// 性能优化: 如果当前区块高度为 blocks 中最新区块的高度 + 1,
+					// 将当前区块添加到待处理的 blocks
 					blocks = append(blocks, nowBlock)
 				}
 
@@ -343,7 +307,7 @@ func blockHeight(b *api.BlockExtention) int64 {
 	return b.BlockHeader.RawData.Number
 }
 
-// sortBlocks sort blocks
+// sortBlocks 将输入的 blocks 按照区块高度升序排序
 func sortBlocks(blocks []*api.BlockExtention) {
 	slices.SortFunc(blocks, func(a, b *api.BlockExtention) int {
 		return int(blockHeight(a) - blockHeight(b))

@@ -13,19 +13,20 @@ import (
 )
 
 func TestStartAndStop(t *testing.T) {
+	c := client.NewGrpcClientWithTimeout("grpc.trongrid.io:50051", 5*time.Second)
+	err := c.Start(client.GRPCInsecure())
+	require.NoError(t, err)
+	defer c.Stop()
+
 	l := New(
-		WithAddr("grpc.trongrid.io:50051"),
-		WithTimeout(5*time.Second),
-		WithDialOptions(
-			client.GRPCInsecure(),
-		),
+		WithClient(c),
 	)
 	ctx := context.Background()
 
-	err := l.Start(ctx)
+	err = l.Start(ctx)
 	require.NoError(t, err)
 
-	time.Sleep(1 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	err = l.Stop(ctx)
 	require.NoError(t, err)

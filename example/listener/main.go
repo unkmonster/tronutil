@@ -10,12 +10,14 @@ import (
 )
 
 func main() {
+	c := client.NewGrpcClientWithTimeout("grpc.trongrid.io:50051", 5*time.Second)
+	err := c.Start(client.GRPCInsecure())
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	listener := tronblocklistener.New(
-		tronblocklistener.WithAddr("grpc.shasta.trongrid.io:50051"),
-		tronblocklistener.WithTimeout(5*time.Second),
-		tronblocklistener.WithDialOptions(
-			client.GRPCInsecure(),
-		),
+		tronblocklistener.WithClient(c),
 		tronblocklistener.WithPersister(tronblocklistener.NewFilePersister("height.txt")),
 	)
 
