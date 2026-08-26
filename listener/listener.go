@@ -39,6 +39,12 @@ func WithClient(client *client.GrpcClient) Option {
 	}
 }
 
+func WithTimeout(t time.Duration) Option {
+	return func(l *Listener) {
+		l.timeout = t
+	}
+}
+
 type Listener struct {
 	logger log.Logger
 	log    *log.Helper
@@ -54,6 +60,10 @@ type Listener struct {
 
 	// 期待的下一个需要处理的区块的高度
 	nextHeight int64
+	// 最新区块高度
+	nowHeight int64
+
+	timeout time.Duration
 }
 
 func New(opts ...Option) *Listener {
@@ -204,82 +214,7 @@ func (l *Listener) worker(ctx context.Context, params *workerParams) {
 		case <-ctx.Done():
 			return
 		case <-tick:
-			var (
-				nowHeight int64
-				nowBlock  *api.BlockExtention
-				err       error
-			)
-
-			// 获取最新区块
-			nowBlock, err = l.client.GetNowBlockCtx(ctx)
-			if err != nil {
-				l.log.WithContext(ctx).Warnw(
-					"msg", "failed to fetch now block",
-					"reason", err,
-				)
-				continue
-			}
-			nowHeight = blockHeight(nowBlock)
-			if nowHeight <= 0 {
-				l.log.WithContext(ctx).Warnw(
-					"msg", "now block with invalid height",
-					"raw", fmt.Sprintf("%+v", nowBlock),
-				)
-				continue
-			}
-
-			if nowHeight == l.nextHeight {
-				// 如果当前区块高度是期待的区块高度，处理这个区块,
-				// 否则开始恢复模式
-				l.processBlocks(ctx, nowBlock)
-				continue
-			}
-
-			// 当前区块高度与期待的区块高度不匹配 (落后于)，
-			// 批量获取并处理 [期待高度, 最新区块高度) 内的所有区块
-			var (
-				begin = l.nextHeight
-				end   = nowHeight
-			)
-
-			for begin < end {
-				blockList, err := l.client.GetBlockByLimitNextCtx(ctx, begin, begin+maxBatchGetBlockSize)
-				if err != nil || len(blockList.Block) == 0 {
-					l.log.WithContext(ctx).Warnw(
-						"msg", "failed to fetch block list",
-						"reason", err,
-						"next", l.nextHeight,
-						"now", nowHeight,
-						"begin", begin,
-						"batch_size", maxBatchGetBlockSize,
-					)
-					break
-				}
-
-				blocks := blockList.GetBlock()
-				sortBlocks(blocks)
-
-				if blockHeight(blocks[len(blocks)-1])+1 == blockHeight(nowBlock) {
-					// 性能优化: 如果当前区块高度为 blocks 中最新区块的高度 + 1,
-					// 将当前区块添加到待处理的 blocks
-					blocks = append(blocks, nowBlock)
-				}
-
-				if blockHeight(blocks[0]) != l.nextHeight {
-					l.log.WithContext(ctx).Warnw(
-						"msg", "fist block height of GetBlockByLimitNextCtx result is mismatch with next_height",
-						"block_list.first", blockHeight(blocks[0]),
-						"block_list.last", blockHeight(blocks[len(blocks)-1]),
-						"next", l.nextHeight,
-						"now", nowHeight,
-						"begin", begin,
-						"batch_size", maxBatchGetBlockSize,
-					)
-					break
-				}
-				l.processBlocks(ctx, blocks...)
-				begin += maxBatchGetBlockSize
-			}
+			l.tick(ctx)
 		}
 	}
 }
@@ -290,6 +225,108 @@ func (l *Listener) AddBlockHandler(h HandleBlockFunc) {
 
 func (l *Listener) ResetBlockHandlers(handlers []HandleBlockFunc) {
 	l.blockHandlers = handlers
+}
+
+func (l *Listener) NextHeight() int64 {
+	return l.nextHeight
+}
+
+func (l *Listener) NowHeight() int64 {
+	return l.nowHeight
+}
+
+func (l *Listener) tick(ctx context.Context) {
+	if l.timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, l.timeout)
+		defer cancel()
+	}
+
+	var (
+		nowHeight int64
+		nowBlock  *api.BlockExtention
+		err       error
+	)
+
+	// 获取最新区块高度
+	nowBlock, err = l.client.GetNowBlockCtx(ctx)
+	if err != nil {
+		l.log.WithContext(ctx).Warnw(
+			"msg", "failed to fetch now block",
+			"reason", err,
+		)
+		return
+	}
+	nowHeight = blockHeight(nowBlock)
+	if nowHeight <= 0 {
+		l.log.WithContext(ctx).Warnw(
+			"msg", "now block with invalid height",
+			"raw", fmt.Sprintf("%+v", nowBlock),
+		)
+		return
+	}
+	l.nowHeight = nowHeight
+
+	if nowHeight == l.nextHeight {
+		// 如果当前区块高度是期待的区块高度，处理这个区块,
+		// 否则开始恢复模式
+		l.processBlocks(ctx, nowBlock)
+		return
+	}
+
+	l.log.WithContext(ctx).Warnw(
+		"event", "scanned block behind of now block",
+		"now", nowHeight,
+		"next_height", l.nextHeight,
+	)
+
+	// 当前区块高度与期待的区块高度不匹配 (落后于)，
+	// 批量获取并处理 [期待高度, 最新区块高度) 内的所有区块
+	var (
+		begin = l.nextHeight
+		end   = nowHeight
+	)
+
+	for begin < end {
+		left := begin
+		right := min(end, left+maxBatchGetBlockSize)
+		blockList, err := l.client.GetBlockByLimitNextCtx(ctx, left, right)
+		if err != nil || len(blockList.Block) == 0 {
+			l.log.WithContext(ctx).Warnw(
+				"msg", "failed to fetch block list",
+				"reason", err,
+				"next", l.nextHeight,
+				"now", nowHeight,
+				"begin", begin,
+				"batch_size", maxBatchGetBlockSize,
+			)
+			break
+		}
+
+		blocks := blockList.GetBlock()
+		sortBlocks(blocks)
+
+		if blockHeight(blocks[len(blocks)-1])+1 == blockHeight(nowBlock) {
+			// 性能优化: 如果当前区块高度为 blocks 中最新区块的高度 + 1,
+			// 将当前区块添加到待处理的 blocks
+			blocks = append(blocks, nowBlock)
+		}
+
+		if blockHeight(blocks[0]) != l.nextHeight {
+			l.log.WithContext(ctx).Warnw(
+				"msg", "fist block height of GetBlockByLimitNextCtx result is mismatch with next_height",
+				"block_list.first", blockHeight(blocks[0]),
+				"block_list.last", blockHeight(blocks[len(blocks)-1]),
+				"next", l.nextHeight,
+				"now", nowHeight,
+				"left", left,
+				"right", right,
+			)
+			break
+		}
+		l.processBlocks(ctx, blocks...)
+		begin = right
+	}
 }
 
 func buildHelper(logger log.Logger) *log.Helper {
