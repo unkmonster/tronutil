@@ -149,6 +149,12 @@ func (l *Listener) getNowHeight(ctx context.Context) (int64, error) {
 }
 
 func (l *Listener) handleBlock(ctx context.Context, b *api.BlockExtention) {
+	if l.timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, l.timeout)
+		defer cancel()
+	}
+
 	for _, h := range l.blockHandlers {
 		h(ctx, b)
 	}
@@ -160,7 +166,7 @@ func (l *Listener) handleBlock(ctx context.Context, b *api.BlockExtention) {
 	)
 }
 
-func (l *Listener) trySaveNextHeight(ctx context.Context) {
+func (l *Listener) saveNextHeight(ctx context.Context) {
 	if l.persister != nil {
 		err := l.persister.SaveNextHeight(ctx, l.nextHeight)
 		if err != nil {
@@ -194,7 +200,7 @@ func (l *Listener) processBlocks(ctx context.Context, blocks ...*api.BlockExtent
 		// 将导致这个区块在重启后被重复处理
 		l.handleBlock(ctx, block)
 		l.nextHeight++
-		l.trySaveNextHeight(ctx)
+		l.saveNextHeight(ctx)
 	}
 
 }
@@ -236,12 +242,6 @@ func (l *Listener) NowHeight() int64 {
 }
 
 func (l *Listener) tick(ctx context.Context) {
-	if l.timeout != 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, l.timeout)
-		defer cancel()
-	}
-
 	var (
 		nowHeight int64
 		nowBlock  *api.BlockExtention
