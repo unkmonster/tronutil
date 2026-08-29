@@ -206,6 +206,10 @@ func (l *Listener) processBlocks(ctx context.Context, blocks ...*api.BlockExtent
 	sortBlocks(blocks)
 
 	for _, block := range blocks {
+		if ctx.Err() != nil {
+			break
+		}
+
 		curHeight := blockHeight(block)
 		if curHeight != l.nextHeight {
 			l.log.WithContext(ctx).Warnw(
@@ -247,9 +251,6 @@ func (l *Listener) worker(ctx context.Context, params *workerParams) {
 }
 
 func (l *Listener) tick(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, TickTimeout)
-	defer cancel()
-
 	var (
 		nowHeight int64
 		nowBlock  *api.BlockExtention
@@ -258,7 +259,7 @@ func (l *Listener) tick(ctx context.Context) {
 	)
 
 	// 获取最新区块高度
-	nowBlock, err = l.client.GetNowBlockCtx(ctx)
+	nowBlock, err = l.client.GetNowBlock()
 	if err != nil {
 		l.log.WithContext(ctx).Warnw(
 			"msg", "failed to fetch now block",
@@ -311,7 +312,7 @@ func (l *Listener) tick(ctx context.Context) {
 			right = min(end, left+maxBatchGetBlockSize)
 		)
 
-		blockList, err := l.client.GetBlockByLimitNextCtx(ctx, left, right)
+		blockList, err := l.client.GetBlockByLimitNext(left, right)
 		if err != nil || len(blockList.Block) == 0 {
 			l.log.WithContext(ctx).Warnw(
 				"msg", "failed to fetch block list",
