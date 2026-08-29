@@ -197,7 +197,7 @@ func (l *Listener) trySaveNextHeight(ctx context.Context) {
 
 // processBlocks processes given blocks, returns expected next block height
 // input blocks must be non-empty
-func (l *Listener) processBlocks(ctx context.Context, blocks ...*api.BlockExtention) {
+func (l *Listener) processBlocks(ctx context.Context, blocks ...*api.BlockExtention) int64 {
 	// make sure the blocks is in increasing order
 	sortBlocks(blocks)
 
@@ -205,19 +205,21 @@ func (l *Listener) processBlocks(ctx context.Context, blocks ...*api.BlockExtent
 		curHeight := blockHeight(block)
 		if curHeight != l.nextHeight {
 			l.log.WithContext(ctx).Warnw(
-				"msg", "current height is mismatch with expected next height",
+				"msg", "failed to process blocks",
+				"reason", "current block height is mismatch with next_height",
 				"current", curHeight,
 				"next", l.nextHeight,
 			)
 			break
 		}
 
-		// 保存 next_height 后再处理区块，避免因断电，重启导致区块被重复处理
+		// 保存 next_height 后再处理区块，避免因断电，重启导致的区块被重复处理
 		// 但是可能导致区块被略过处理
 		l.nextHeight++
 		l.trySaveNextHeight(ctx)
 		l.handleBlock(ctx, block)
 	}
+	return l.nextHeight
 }
 
 type workerParams struct {
@@ -282,22 +284,26 @@ func (l *Listener) tick(ctx context.Context) {
 	}
 
 	// 已扫描区块高度落后于最新区块高度 (nextHeight < nowHeight)，
-	// 批量获取并处理 [期待高度, 最新区块高度) 内的所有区块
+	// 批量获取并处理 [期待高度, 最新区块高度] 内的所有区块
 
 	l.log.WithContext(ctx).Warnw(
-		"event", "scanned block behind of now block",
+		"event", "block scanner is behind",
 		"now", nowHeight,
-		"next_height", l.nextHeight,
+		"next", l.nextHeight,
+		"lag", nowHeight-l.nextHeight,
 	)
 
 	var (
 		begin = l.nextHeight
-		end   = nowHeight
+		end   = nowHeight + 1
 	)
 
 	for begin < end {
-		left := begin
-		right := min(end, left+maxBatchGetBlockSize)
+		var (
+			left  = begin
+			right = min(end, left+maxBatchGetBlockSize)
+		)
+
 		blockList, err := l.client.GetBlockByLimitNextCtx(ctx, left, right)
 		if err != nil || len(blockList.Block) == 0 {
 			l.log.WithContext(ctx).Warnw(
@@ -306,36 +312,25 @@ func (l *Listener) tick(ctx context.Context) {
 				"next", l.nextHeight,
 				"now", nowHeight,
 				"begin", begin,
-				"batch_size", maxBatchGetBlockSize,
-			)
-			break
-		}
-
-		blocks := blockList.GetBlock()
-		sortBlocks(blocks)
-
-		// if blockHeight(blocks[len(blocks)-1])+1 == blockHeight(nowBlock) {
-		// 	// 性能优化: 如果当前区块高度为 blocks 中最新区块的高度 + 1,
-		// 	// 将当前区块添加到待处理的 blocks
-		// 	blocks = append(blocks, nowBlock)
-		// }
-
-		// 区块列表中第一个区块的高度必须等于期待高度
-		if blockHeight(blocks[0]) != l.nextHeight {
-			l.log.WithContext(ctx).Warnw(
-				"msg", "fist block height of block_list is mismatch with next_height",
-				"block_list.first", blockHeight(blocks[0]),
-				"block_list.last", blockHeight(blocks[len(blocks)-1]),
-				"next", l.nextHeight,
-				"now", nowHeight,
+				"end", end,
 				"left", left,
 				"right", right,
 			)
 			break
 		}
-		l.processBlocks(ctx, blocks...)
-		begin = right
+
+		blocks := blockList.GetBlock()
+
+		// 从下个期待高度继续获取区块
+		sortBlocks(blocks)
+		begin = l.processBlocks(ctx, blocks...)
 	}
+
+	l.log.WithContext(ctx).Infow(
+		"event", "block scanner caught up",
+		"now", nowHeight,
+		"next", l.nextHeight,
+	)
 }
 
 func buildHelper(logger log.Logger) *log.Helper {
