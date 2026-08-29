@@ -17,6 +17,10 @@ const (
 	blockProducedSpeed   = 3 * time.Second
 )
 
+var (
+	TickTimeout = 60 * time.Second
+)
+
 type HandleBlockFunc func(ctx context.Context, b *api.BlockExtention)
 
 type Option func(l *Listener)
@@ -243,6 +247,9 @@ func (l *Listener) worker(ctx context.Context, params *workerParams) {
 }
 
 func (l *Listener) tick(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, TickTimeout)
+	defer cancel()
+
 	var (
 		nowHeight int64
 		nowBlock  *api.BlockExtention
